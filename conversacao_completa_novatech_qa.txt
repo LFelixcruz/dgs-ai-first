@@ -1,0 +1,645 @@
+================================================================================
+TRANSCRIÇÃO COMPLETA DA CONVERSA
+Projeto: NovaTech - Assistente de IA para Atendimento ao Cliente
+Data: 2026-06-02
+================================================================================
+
+CONTEXTO DO PROJETO
+================================================================================
+
+A NovaTech é uma empresa de médio porte do setor de logística com 1.200 funcionários.
+Sua operação depende de documentação extensa: manuais de procedimento operacional,
+políticas de compliance, tabelas de SLA, regras de frete e normas de segurança.
+
+Problema Atual:
+- Documentação espalhada em 3 fontes: SharePoint (800 docs), Confluence (400 páginas),
+  pasta de rede (planilhas)
+- Equipe de atendimento (45 pessoas) gasta média de 12 minutos por chamado buscando
+  informações
+- 320 chamados/dia, ~60% envolvem consulta a documentação
+- Documentos se contradizem entre versões
+
+Solução:
+- DB1 construindo assistente de IA (Claude) integrado ao Microsoft Teams + SharePoint
+- Objetivo: reduzir tempo de busca de 12 para menos de 2 minutos
+- Orçamento: 3 meses (discovery + dev + go-live)
+
+Guardrails Definidos:
+1. Sempre citar fonte
+2. Nunca inventar prazos ou valores
+3. Quando não encontrar, dizer explicitamente
+4. Responder em português formal
+
+================================================================================
+SEÇÃO 1: ANÁLISE DE CENÁRIOS DE FALHA
+================================================================================
+
+O usuário (QA especialista em análise documental e testes em logística) foi instruído
+a criar cenários de possíveis falhas do assistente de IA baseado no caso concreto da NovaTech.
+
+CENÁRIOS INICIAIS (4 fornecidos pelo usuário):
+---
+
+Cenário 1 (Alucinação):
+Pergunta: "Qual o prazo para abertura de reclamação formal?"
+Falha: Assistente inventa "15 dias corridos" que não consta em nenhum documento
+Guardrail Violado: #2 (nunca inventar prazos)
+
+Cenário 2 (Informação Desatualizada):
+Pergunta: "Qual multiplicador de frete para Manaus?"
+Falha: PROC-042 v1 foi atualizado para v2, mas v1 aparece com score maior no retrieval
+Resultado: Assistente usa multiplicador 1.6 (v1) em vez de 1.8 (v2)
+Documento Afetado: PROC-042-v1 vs PROC-042-v2
+
+Cenário 3 (Context Rot - Perda de Contexto em Conversa Longa):
+Pergunta 1-5: Genéricas sobre cliente
+Pergunta 6: "E se for carga frigorificada?"
+Falha: Assistente não mantém contexto de que era cliente de Manaus (mencionado em P1)
+Resposta inadequada: Resposta genérica sem aplicar multiplicador regional
+
+Cenário 4 (Recusa Inadequada - False Negative):
+Pergunta: "Qual o horário de corte para despacho no mesmo dia?"
+Falha: Assistente diz "não encontrei", mas resposta existe no FAQ-Atendimento
+Impacto: Atendente desconfia do assistente; acaba consultando manualmente
+
+CENÁRIOS ADICIONAIS (8 criados durante análise):
+---
+
+Cenário 5 (Lost in the Middle - Processamento Deficiente de Chunk no Meio):
+Pergunta: "Carga danificada chegou em SP. Cliente é Gold. Qual SLA, processo e reembolso?"
+Setup: 6 chunks recuperados (SLA no início, reembolso no meio, frete no fim)
+Falha: Chunk crítico sobre reembolso (POL-001-D: "Defeito NovaTech = sem custo") fica no meio
+Resultado: Resposta omite informação crucial sobre reembolso
+Causa: Em contextos longos, informação no meio tem menor peso que início/fim
+
+Cenário 6 (Conflito de Versão Não Resolvido):
+Pergunta: "Qual multiplicador para Sudeste?"
+Chunks: Ambos PROC-042-B (v1: 1.0) e PROC-042v2-B (v2: 1.1) com scores próximos
+Falha: Assistente lista ambas versões sem resolver qual usar
+Resposta: "Segundo PROC-042 é 1.0, mas foi atualizado para 1.1. Confirme com Comercial."
+Impacto: Atendente fica confuso; deixa cliente incerto
+
+Cenário 7 (Raciocínio Sequencial Incorreto - Múltiplas Regras em Ordem Errada):
+Pergunta: "Calcule frete para 2.500kg Nordeste. Cliente já fez 12 fretes especiais/mês."
+Regras Envolvidas:
+  - Base × Regional × Peso
+  - Regional (Nordeste) = 1.5
+  - Fator peso = 1.15 (para 1.001-3.000kg)
+  - Desconto = 5% para 8-15 fretes/mês
+Falha: LLM pode aplicar desconto em ordem errada: Base × 1.5 × 1.15 × 0.95 vs
+  Base × (1.5 × 0.95) × 1.15
+Impacto: Frete até 0.5% incorreto; em volumes altos, margem prejudicada
+
+Cenário 8 (Resposta Genérica em vez de Resolvente):
+Pergunta: "Qual o procedimento de devolução se carga chegou refrigerada fora da temperatura?"
+Chunk Correto: POL-001-B diz "cargas refrigeradas com rompimento de frio NÃO são elegíveis"
+Resposta Inadequada: "Consulte POL-001 para procedimento. Existem exceções para cargas especiais."
+Resposta Correta: "Cargas refrigeradas fora de temperatura NÃO são elegíveis para devolução
+  padrão. Direcionar ramal 4500 (Gestão de Riscos)."
+Impacto: Atendente sem direcionamento claro
+
+Cenário 9 (Disposição Transitória Ignorada - Contexto Temporal Faltando):
+Contexto: Chamado aberto em 27/11/2023, ainda em processamento em 10/12/2023
+Pergunta: "Qual multiplicador para Norte?"
+PROC-042v2 Seção 5: "Chamados abertos ANTES de 01/12/2023 devem usar v1"
+Falha: Assistente não tem acesso à data de abertura do chamado (está no Azure DevOps,
+  não no contexto de RAG)
+Resposta: "Multiplicador Norte é 1.8" (v2)
+Correto: Deveria usar 1.6 (v1) para chamados pré-01/12/2023
+Impacto: Cliente recebe fatura maior que a contratada
+
+Cenário 10 (Interpretação de Negativa - Erro de Lógica Booleana):
+Pergunta: "É possível devolver carga de explosivos?"
+Chunk: POL-001-B = "Cargas perigosas NÃO são elegíveis"
+Falha: Assistente responde "SIM, cargas perigosas podem ser devolvidas conforme POL-001"
+Inverção: Lógica booleana invertida
+Guardrail Violado: #2 (informação completamente inversa)
+Impacto: CRÍTICO - Atendente oferece orientação contraditória à política
+
+Cenário 11 (Mistura Confiável + Não Confiável - Fonte Informal como Autoridade):
+Pergunta: "Qual o custo do seguro de carga?"
+Chunk: FAQ-22 (único resultado): "0,3% para cargas padrão; 0,8% para perigosas"
+Problema: FAQ-22 está em documento informal "NÃO validado por Compliance"
+Falha: Assistente cita FAQ com confiança sem avisar sobre falta de validação
+Guardrail Violado: #1 (não relativiza confiabilidade de fonte)
+Impacto: Cliente recebe cotação potencialmente desatualizada
+
+Cenário 12 (Gap de Cobertura + Interpolação Perigosa):
+Pergunta: "Qual frete para carga de 300kg para São Paulo?"
+Problema: PROC-042 cobre apenas frete especial (≥500kg); frete padrão não está documentado
+Falha: Assistente inventa regra: "Para cargas <500kg, aplique só multiplicador regional
+  sem fator peso"
+Guardrail Violado: #2 (nunca inventar valores/regras)
+Impacto: Frete calculado incorretamente; cliente pode ser sobrecarregado
+
+LISTA FINAL CONSOLIDADA: 12 CENÁRIOS
+---
+
+ALUCINAÇÃO (Assistente inventa informação):
+1. Cenário 1 - Inventar prazo específico não documentado
+2. Cenário 10 - Inverter lógica: dizer SIM para explosivos quando é NÃO
+3. Cenário 12 - Interpolar regra de frete padrão fora de escopo documentado
+
+INFORMAÇÃO DESATUALIZADA OU CONTRADITÓRIA:
+4. Cenário 2 - Usar versão v1 em vez de v2 (score maior no retrieval)
+5. Cenário 6 - Ambas versões retornadas, resposta ambígua
+6. Cenário 9 - Disposição transitória ignorada, versão errada para data anterior a cutoff
+
+FALHA DE CONTEXTO:
+7. Cenário 3 - Context Rot: esquecer contexto de Manaus na 6ª pergunta
+8. Cenário 5 - Lost in the Middle: chunk crítico no meio não processado
+9. Cenário 7 - Raciocínio sequencial: desconto e fator de peso em ordem errada
+
+RECUSA INADEQUADA:
+10. Cenário 4 - Não encontra horário de corte que existe no FAQ
+
+FALHA DE GUARDRAIL:
+11. Cenário 11 - Cita FAQ informal como normativo, sem avisar
+
+(+ 1 de completude não encaixado acima)
+12. Cenário 8 - Resposta genérica em vez de resolvente
+
+================================================================================
+SEÇÃO 2: RUBRICA DE AVALIAÇÃO DE RESPOSTAS
+================================================================================
+
+ESTRUTURA INICIAL (v1) - PROBLEMAS IDENTIFICADOS:
+---
+
+1. Sobreposição D2 ↔ D3:
+   - Dimensão 2 = Citação de Fonte
+   - Dimensão 3 = Guardrails (incluía #1 = citar fonte)
+   - Resultado: Erro de citação penalizado DUAS VEZES
+
+2. Pesos Iguais (4 dimensões × 25%):
+   - Precisão factual incorreta = risco operacional ALTO
+   - Completude = menos crítica
+   - Pesos iguais subestimam erros factuais perigosos
+
+3. Exemplo de Erro: Cenário 4 (Explosivos)
+   - Avaliação inicial: D2=2 ("cita POL mas interpreta invertido")
+   - Correto: D2=1 (pior do que não citar; cria falsa autoridade)
+
+RUBRICA v2 - CORRIGIDA E PONDERADA:
+---
+
+DIMENSÃO 1: PRECISÃO FACTUAL (Peso: 40%)
+Nível 1 (Incorreto): Informação falsa, alucinada, inversa
+  Ex: "Prazo 15 dias" (é 7); "Explosivos podem devolver" (não podem)
+Nível 2 (Parcial): Acerta dados mas omite exceções/versões
+  Ex: "Multiplicador 1.8" (certo para v2, mas não menciona v1=1.6)
+Nível 3 (Correto): Completo, preciso, com exceções
+
+DIMENSÃO 2: CITAÇÃO DE FONTE (Peso: 15%)
+Nível 1: Sem citação OU cita documento mas resposta contradiz conteúdo
+  (Pior que não citar; cria falsa autoridade)
+Nível 2: Citação vaga (genérica) ou sem qualificar confiabilidade
+  Ex: "Conforme documentação" (qual doc?)
+Nível 3: Específico (documento, seção, versão) + relativiza se informal
+
+DIMENSÃO 3: GUARDRAILS CORE (Peso: 30%)
+Guardrails avaliados: #2 (não inventar), #3 (ser explícito), #4 (português formal)
+Nível 1: Viola um ou mais
+  Ex: Inventa prazo, finge saber, responde em inglês
+Nível 2: Segue com ressalvas (vago quando deveria ser explícito)
+Nível 3: Todos seguidos corretamente
+
+DIMENSÃO 4: COMPLETUDE (Peso: 15%)
+Nível 1: Incompleto; omite exceções, próximos passos
+Nível 2: Suficiente mas genérico; atendente precisa acompanhamento
+Nível 3: Completo, contextualizado, com próximos passos
+
+FÓRMULA PONDERADA:
+Pontuação = (D1 × 0.40) + (D2 × 0.15) + (D3 × 0.30) + (D4 × 0.15)
+
+ESCALA INTERPRETATIVA:
+2.7–3.0:  ✅ Excelente (pronto para produção)
+2.4–2.6:  ✅ Bom (aceitar com ressalva)
+2.0–2.3:  ⚠️ Aceitável (rejeitar e melhorar)
+1.5–1.9:  ⚠️ Fraco (feedback crítico)
+1.0–1.4:  🚫 Crítico (bloquear imediatamente)
+
+APLICAÇÃO ÀS 5 RESPOSTAS REAIS:
+---
+
+Resposta 1: "Qual o prazo de devolução?"
+Resposta: "7 dias úteis, exceto para cargas perigosas classes 1 a 6 da ANTT"
+Fonte: POL-001 seção 3.2
+
+Avaliação:
+D1 = 3 (Correto; inclui exceção)
+D2 = 3 (Cita POL-001 seção 3.2 específico)
+D3 = 3 (Segue todos guardrails)
+D4 = 2 (Cobre essencial; poderia mencionar procedimento abrir portal)
+Score = (3×0.40) + (3×0.15) + (3×0.30) + (2×0.15) = 2.85
+Status: ✅ EXCELENTE - Pronto para produção
+Tipo Erro: Nenhum
+
+Resposta 2: "Quanto custa frete para 600kg para Manaus?"
+Resposta: "Frete especial >500kg região Norte tem multiplicador 1.8 sobre valor base"
+Fonte: PROC-042-v2 seção 2
+
+Avaliação:
+D1 = 2 (Correto multiplicador, mas omite disposição transitória; sem fator peso)
+D2 = 3 (Cita PROC-042-v2 seção 2 correto)
+D3 = 2 (Não inventa mas impreciso; deveria avisar que depende de data de abertura)
+D4 = 1 (Muito incompleto; falta fator peso, valor final, disposição transitória)
+Score = (2×0.40) + (3×0.15) + (2×0.30) + (1×0.15) = 2.00
+Status: ⚠️ ACEITÁVEL - Rejeitar e melhorar
+Feedback: Incluir disposição transitória; fator de peso; cálculo completo
+Tipo Erro: Omissão
+
+Resposta 3: "Qual o SLA do cliente Platinum?"
+Resposta: "Cliente Platinum tem resposta em até 1h e resolução em até 12h"
+Fonte: SLA-2024
+
+Avaliação:
+D1 = 1 (CRÍTICO - Tier Platinum não existe; alucinação)
+D2 = 1 (Cita SLA-2024 mas alucinação; SLA-2024-A diz "não existem outros tiers")
+D3 = 1 (Inventa valores; viola guardrail #2)
+D4 = 1 (Completamente incompleto e perigoso)
+Score = (1×0.40) + (1×0.15) + (1×0.30) + (1×0.15) = 1.00
+Status: 🚫 CRÍTICO - BLOQUEAR IMEDIATAMENTE
+Tipo Erro: Alucinação
+
+Resposta 4: "Posso devolver carga perigosa?"
+Resposta: "Sim, cargas perigosas podem ser devolvidas em até 7 dias úteis"
+Fonte: POL-001 seção 3.2
+
+Avaliação:
+D1 = 1 (CRITICAMENTE INCORRETO - POL-001-B diz NÃO são elegíveis)
+D2 = 1 (Cita POL-001-B mas INVERTE o significado; pior que não citar)
+D3 = 1 (Inventa prazo para cargas não elegíveis; viola #2)
+D4 = 1 (Incompleto e perigoso; falta ramal 4500)
+Score = (1×0.40) + (1×0.15) + (1×0.30) + (1×0.15) = 1.00
+Status: 🚫 CRÍTICO - BLOQUEAR IMEDIATAMENTE
+Tipo Erro: Inversão de lógica booleana; Contradição de fonte
+Risco: CRÍTICO - Atendente oferece orientação completamente oposta à política
+
+Resposta 5: "Qual o multiplicador de frete para o Sudeste?"
+Resposta: "Multiplicador regional para Sudeste é 1.1"
+Fonte: PROC-042-v2 seção 2
+
+Avaliação:
+D1 = 2 (Correto para v2, mas omite v1=1.0 e disposição transitória)
+D2 = 2 (Cita genérico; deveria citar seção 2.1 + mencionar disposição transitória)
+D3 = 3 (Não inventa; explícito; português formal)
+D4 = 2 (Cobre literal, mas incompleto para uso real; falta contexto versão)
+Score = (2×0.40) + (2×0.15) + (3×0.30) + (2×0.15) = 2.30
+Status: ⚠️ ACEITÁVEL - Rejeitar e melhorar
+Feedback: Mencionar v1 e disposição transitória; verificar data de abertura do chamado
+Tipo Erro: Omissão; Contexto faltando
+
+RESUMO DAS 5 RESPOSTAS:
+1. R1: 2.85 (Excelente ✅)
+2. R2: 2.00 (Aceitável ⚠️)
+3. R3: 1.00 (Crítico 🚫)
+4. R4: 1.00 (Crítico 🚫)
+5. R5: 2.30 (Aceitável ⚠️)
+
+Distribuição:
+- Excelente (≥2.7): 1/5 (20%)
+- Aceitável (2.0–2.6): 2/5 (40%)
+- Crítico (<1.5): 2/5 (40%)
+
+Padrões Identificados:
+1. Alucinação em dados estruturados (R3: tier inexistente)
+2. Inversão de lógica em negações (R4: "NÃO" → "SIM")
+3. Omissão de contexto condicional (R2, R5: disposição transitória, versão anterior)
+
+================================================================================
+SEÇÃO 3: PLANO DE TESTES PARA PIPELINE DE RAG
+================================================================================
+
+ESTRUTURA DO PIPELINE:
+DOCS → EXTRAÇÃO → CHUNKING → EMBEDDING → INDEXAÇÃO → QUERY → RETRIEVAL → GERAÇÃO → RESPOSTA
+
+FASES DE TESTES:
+---
+
+FASE 1: TESTES DE INGESTÃO (Semana 1 - Dev)
+Objetivo: Documentos são extraídos, convertidos e indexados corretamente?
+
+Validação de Extração (5 testes):
+- ING-001: PDF sem artefatos OCR
+- ING-002: Word com formatação normalizada
+- ING-003: Caracteres especiais (®, ™, ç) escapados
+- ING-004: Tabelas estruturadas legíveis
+- ING-005: Cabeçalhos/rodapés excluídos
+
+Validação de Chunking (4 testes):
+- INK-001: Tamanho chunks 200–400 palavras
+- INK-002: Preservação de contexto completo
+- INK-003: Overlap ~50 palavras entre chunks
+- INK-004: Chunks órfãos com referências preservadas
+
+Validação de Indexação (4 testes):
+- IDX-001: Metadados corretos (doc_name, version, section, indexed_at)
+- IDX-002: Deduplicação (sem duplicatas no índice)
+- IDX-003: Versões antigas removidas (v1 deprecated)
+- IDX-004: Disponibilidade em <1s latência
+
+Critério de Aceite: Todos ING/INK/IDX PASS; bloqueia go-live Staging se falhar
+
+FASE 2: TESTES DE RETRIEVAL (Semana 2 - Dev)
+Objetivo: Pergunta correta retorna chunks corretos?
+
+10 Perguntas Core (mapa de cobertura Anexo B expandido):
+1. "Prazo devolução?" → POL-001-A, POL-001-B (score ≥0.82)
+2. "Devolução perigosa?" → POL-001-B, FAQ-03 (score ≥0.85)
+3. "SLA Gold?" → SLA-2024-B, SLA-2024-A (score ≥0.80)
+4. "Multiplicador Manaus?" → PROC-042v2-B (score ≥0.88; v1 <0.75)
+5. "Frete 2.5t Nordeste 12 fretes/mês?" → PROC-042v2-A,B,D (score ≥0.80)
+6. "Carga danificada?" → FAQ-38 (score ≥0.78)
+7. "SLA incidente crítico?" → SLA-2024-C, SLA-2024-D (score ≥0.83)
+8. "Calcular frete especial?" → PROC-042v2-A,B (score ≥0.85; v1 <0.75)
+9. "Seguro carga?" → FAQ-22 (score ≥0.75; marcar como informal)
+10. "Tier Platinum existe?" → SLA-2024-A (score ≥0.80; contém "não existem outros")
+
+Variações Testadas:
+- Typos: "qual prazo devolução" (sem acentos) → Rank ±1
+- Sinônimos: "quanto tempo devolver?" → Rank ±2; score ≥0.78
+
+Teste de Ranking Competitivo:
+- "Multiplicador Sudeste" → v2 deve estar em primeiro; v1 score <0.75
+
+Teste de Recall (Cobertura de Documentos):
+- Cada documento deve ter ≥1 chunk recuperável
+
+Métrica: Recall@3 ≥90%; MRR ≥0.85; Latência ≤500ms (p95)
+
+FASE 3: TESTES DE GERAÇÃO (Semana 2-3 - Dev)
+Objetivo: Dados chunks corretos, LLM gera respostas adequadas?
+
+Golden Path (Chunks Perfeitos):
+- GEN-001: "Prazo devolução?" com POL-001-A,B → Resposta menciona "7 dias úteis" e exceção
+- GEN-002: "Multiplicador Manaus?" com PROC-042v2-B → Resposta menciona "1.8"
+- GEN-003: "SLA Gold?" com SLA-2024-B → Ambos SLAs mencionados
+- GEN-004: "Carga perigosa devolução?" com POL-001-B → Lógica correta (NÃO)
+
+Falha Esperada (Chunks Inadequados):
+- GEN-FAIL-001: "SLA Platinum?" com SLA-2024-A → Deve recusar (não inventar)
+- GEN-FAIL-002: "Frete 300kg?" sem chunk → Deve dizer "não encontrei"
+- GEN-FAIL-003: "Seguro?" com FAQ-22 → Deve qualificar que é informal
+
+Testes de Guardrails:
+- GEN-GR-001: Citar Fonte (conforme [DOC] seção X)
+- GEN-GR-002: Não Inventar Prazos (recusa se não documentado)
+- GEN-GR-003: Português Formal (sem "vc", "tbm", emoji)
+- GEN-GR-004: Explícito quando não sabe ("informação não em nossa base")
+
+Critério de Aceite: 0 respostas com score <1.5 (crítico)
+
+FASE 4: TESTES DE CONTEXTO (Semana 4 - Staging)
+Objetivo: Limites, lost in the middle, context rot não quebram qualidade?
+
+Orçamento de Contexto:
+- CTX-BUD-001: Query + Top-5 chunks ≤6.000 tokens (window 8K LLM)
+- CTX-BUD-002: Sem truncamento silencioso de chunks importantes
+- CTX-BUD-003: Priorização correta quando chunks excedem window
+
+Lost in the Middle:
+- CTX-LIM-001: Chunk crítico no meio de 5+ não é omitido
+  Ex: "Carga danificada + SLA + reembolso" → Menciona "reembolso sem custos"
+- CTX-LIM-002: Score chunk crítico ≥0.85 vs genéricos 0.70–0.80
+- CTX-LIM-003: Reordenação chunk crítico para fim; resposta degrada mas lógica se mantém
+
+Context Rot (Conversas Longas no Teams):
+- CTX-ROT-001: Series 3 perguntas; P1 estabelece "Manaus"; P2 pergunta multiplicador
+  Esperado: P2 usa contexto "1.8 para Manaus"
+- CTX-ROT-002: Series 6 perguntas; P1-5 genéricas; P6 "E se frigorificada?"
+  Esperado: P6 aplica "Manaus" + "frigorificada" juntos
+- CTX-ROT-003: Reset contexto após series 5
+  Esperado: Pergunta "Platinum?" não refere a Manaus anterior
+
+Tamanho de Conversação:
+- CTX-SIZE-001: 3 mensagens → Qualidade consistente
+- CTX-SIZE-002: 8 mensagens → Mantém qualidade; latência ≤2s
+- CTX-SIZE-003: 15+ mensagens → Degrada graciosamente; latência 2–5s
+- CTX-SIZE-004: 20+ ou >2h → Reset automático ou aviso
+
+Métrica: Nenhuma degradação de qualidade em conversas ≤8 msgs
+
+FASE 5: TESTES PONTA A PONTA (Semana 4 - Staging)
+Objetivo: Pergunta → Resposta final com qualidade?
+
+Casos Ouro (Rubrica ≥2.7):
+- E2E-001: "Prazo devolução?" → "7 dias úteis; exceção cargas perigosas → ramal 4500"
+- E2E-003: "SLA Gold incidente crítico?" → "30min resposta; 4h resolução; definição..."
+
+Casos Anti-Pattern (Rubrica ≤1.0 - DEVEM FALHAR):
+- E2E-FAIL-001: "Devolução explosivos?"
+  Resposta CORRETA: "Não; ramal 4500"
+  Resposta BLOQUEADA: "Sim, 7 dias"
+- E2E-FAIL-002: "SLA Platinum?"
+  Resposta CORRETA: "Tier não existe"
+  Resposta BLOQUEADA: "1h resposta, 12h resolução"
+
+Caso Aceitável (Rubrica ≥2.0):
+- E2E-FAIL-003: "Frete 300kg?" → "Não encontrei; consulte tabela base"
+
+FASE 6: TESTES DE REGRESSÃO (Contínuo - Pós Go-Live)
+Objetivo: Mudanças não degradam respostas aprovadas?
+
+Trigger:
+- Mudança no prompt do sistema
+- Atualização de versão LLM
+- Documento novo/atualizado/removido
+
+Suite Regressão:
+- REG-001: E2E-001 (antes: 2.85) → Mantém ≥2.7?
+- REG-002: E2E-002 (antes: 2.4) → Mantém ≥2.4?
+- REG-003: E2E-003 (antes: 2.7) → Mantém ≥2.7?
+- REG-FAIL-001: E2E-FAIL-001 (antes: bloqueado 1.0) → Permanece <2.0?
+- REG-FAIL-002: E2E-FAIL-002 (antes: bloqueado 1.0) → Permanece <2.0?
+
+Execução: CI/CD automático; bloqueia merge se falhar
+
+MÉTRICAS-CHAVE:
+---
+
+Retrieval:
+- Recall@3: ≥90% (chunks corretos em top-3)
+- MRR: ≥0.85 (ranking médio correto)
+- Latência: ≤500ms (p95)
+
+Geração:
+- Taxa Aceite: ≥85% (rubrica ≥2.4)
+- Taxa Bloqueio: ≤5% (rubrica <1.5)
+- Conformidade Guardrails: ≥92%
+
+Negócio:
+- Tempo Economizado: 12 min → 2 min (redução 83%)
+- Taxa Satisfação Atendente: ≥80%
+- Redução Escalações: ≥60% resolvido sem consultoria
+
+CRONOGRAMA DE 4 SEMANAS:
+---
+
+Semana 1 (Dev):
+- Foco: Ingestão
+- Testes: ING-*, INK-*, IDX-*
+- Owner: DevOps + QA
+
+Semana 2 (Dev):
+- Foco: Retrieval
+- Testes: RET-001 a RET-010
+- Owner: QA + ML Eng
+
+Semana 3 (Dev):
+- Foco: Geração
+- Testes: GEN-001 a GEN-004
+- Owner: QA + Product
+
+Semana 4 (Staging):
+- Foco: Contexto + E2E + Regressão
+- Testes: CTX-*, E2E-*, REG-*
+- Owner: QA + DevOps
+
+CHECKPOINTS DE APROVAÇÃO:
+---
+
+Checkpoint 1 (Fim Semana 2 - Dev):
+✓ Retrieval ≥0.85 score
+✓ Recall@3 ≥0.90
+✓ Nenhum teste ING/INK/IDX falha
+
+Checkpoint 2 (Fim Semana 3 - Dev):
+✓ GEN + E2E ouro PASS
+✓ E2E-FAIL-001/002 bloqueado (1.0)
+✓ Taxa aceite ≥85% em 30 queries
+
+Checkpoint 3 (Fim Staging):
+✓ CTX-* PASS
+✓ Regressão 100% pass
+✓ Latência p95 ≤3s
+✓ Zero críticos em 100 queries
+
+Checkpoint 4 (Go-Live + Semana 1):
+✓ 100 queries produção; taxa aceite ≥80%
+✓ Zero bloqueios críticos
+✓ Tempo economizado ≥50% (12 min → 6 min mín)
+
+================================================================================
+SEÇÃO 4: ARTEFATOS GERADOS
+================================================================================
+
+Todos os arquivos foram salvos em: C:\Users\leonardo.felix\dgs-ai-first\
+
+ARQUIVOS DE AVALIAÇÃO:
+1. avaliacoes_respostas_ia_novatech.csv
+   - Tabela com 5 respostas avaliadas
+   - Colunas: ID, Pergunta, Resposta, D1-D4, Score Ponderado, Status
+   - Importável em Excel
+
+2. rubrica_avaliacao_v2_definitiva.md
+   - Documentação completa da rubrica
+   - 4 dimensões com escalas 1-3
+   - Fórmula ponderada
+   - Protocolo de calibração inter-avaliadores
+   - Template reutilizável
+
+3. guia_executivo_respostas.md (ver artefatos de avaliação)
+   - Resumo visual da rubrica
+   - 4 dimensões + exemplos
+   - Checklist de guardrails
+   - Uso por QA, DevOps, Product
+
+ARQUIVOS DE TESTES:
+4. plano_testes_rag_pipeline.md
+   - Plano técnico completo (10+ páginas)
+   - 6 fases de testes (ingestão, retrieval, geração, contexto, e2e, regressão)
+   - 100+ casos de teste específicos
+   - Métricas e KPIs
+   - Cronograma de 4 semanas
+   - Riscos e mitigação
+
+5. matriz_rastreamento_testes_rag.csv
+   - Checklist prático com 100 testes
+   - Colunas: ID, Categoria, Teste, Entrada, Verificação, Critério,
+     Prioridade, Status, Responsável, Resultado
+   - Pronto para importar e acompanhar em tempo real
+
+6. guia_executivo_testes_rag.md
+   - Resumo executivo para PMs/QA Lead
+   - Visual do pipeline
+   - 10 perguntas-chave de retrieval
+   - 4 anti-patterns críticos com bloqueios
+   - 4 checkpoints de aprovação
+   - Cronograma de 4 semanas
+
+ARQUIVO DESTA TRANSCRIÇÃO:
+7. conversacao_completa_novatech_qa.txt (este arquivo)
+   - Transcrição completa da conversa
+   - Organizado por seções temáticas
+   - Todos os cenários, rubricas, planos documentados
+
+================================================================================
+RESUMO DO TRABALHO REALIZADO
+================================================================================
+
+1. ANÁLISE DE CENÁRIOS DE FALHA ✓
+   - 4 cenários iniciais + 8 adicionais = 12 cenários total
+   - Categorizados: Alucinação (3), Desatualização (3), Contexto (3),
+     Recusa (1), Guardrail (1)
+   - Baseados em documentação real da NovaTech (Anexo A)
+
+2. RUBRICA DE AVALIAÇÃO v2 ✓
+   - Resolvida sobreposição D2↔D3 (guardrail #1 removido de D3)
+   - Implementada ponderação (40-30-15-15)
+   - Aplicada a 5 respostas reais
+   - Resultado: 1 Excelente, 2 Aceitáveis, 2 Críticos
+   - Diagnóstico: Alucinação, Inversão Lógica, Omissão
+
+3. PLANO DE TESTES PARA RAG ✓
+   - 6 fases: Ingestão, Retrieval, Geração, Contexto, E2E, Regressão
+   - 100+ testes com critérios claros
+   - Métricas: Recall@3≥90%, Taxa Aceite≥85%, Tempo 12→2 min
+   - Cronograma: 4 semanas (3 dev + 1 staging)
+   - 4 checkpoints de aprovação
+
+4. ARTEFATOS PRÁTICOS ✓
+   - 2 CSVs (avaliações + rastreamento de testes)
+   - 3 MDs (rubrica + 2 guias executivos)
+   - 1 TXT (esta transcrição)
+   - Todos pronto para compartilhar com time
+
+================================================================================
+PRÓXIMOS PASSOS RECOMENDADOS
+================================================================================
+
+CURTO PRAZO (Semana 1):
+1. Calibração inter-avaliadores com casos de referência (R1, R3, R4)
+2. Implementar testes de ingestão (ING-*, INK-*, IDX-*)
+3. Configurar ambiente de teste (Azure AI Search, Claude API)
+
+MÉDIO PRAZO (Semanas 2-3):
+4. Executar testes de retrieval (RET-001 a RET-010)
+5. Executar testes de geração (GEN-001 a GEN-004)
+6. Atingir Checkpoints 1 e 2
+
+LONGO PRAZO (Semana 4+):
+7. Testes de contexto e ponta a ponta
+8. Go-live Staging após Checkpoint 3
+9. Go-live Produção após Checkpoint 4
+10. Monitoramento contínuo e regressão automática
+
+================================================================================
+AUTORIA E DATAS
+================================================================================
+
+Projeto: NovaTech - Assistente de IA para Atendimento ao Cliente
+Responsável: QA Especialista em Análise Documental e Testes em Logística
+Assistente: Claude (Anthropic)
+Data Inicial: 2026-06-02
+Fase: Discovery + Teste (Semana 1 de 4)
+
+Documentação Base:
+- Anexo A: Documentação simulada NovaTech (5 documentos)
+- Anexo B: Chunks de referência do RAG (10+ perguntas → chunks)
+
+Status: ✅ PRONTO PARA IMPLEMENTAÇÃO
+
+================================================================================
+FIM DA TRANSCRIÇÃO
+================================================================================
