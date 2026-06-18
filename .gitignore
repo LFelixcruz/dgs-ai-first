@@ -1,0 +1,17 @@
+# Ignorar tudo no Desktop por padrão
+/*
+
+# Incluir este próprio arquivo
+!.gitignore
+
+# Incluir apenas as pastas do projeto DGS AI First
+!DGS-AI-FIRST/
+!Correção/
+
+# Ignorar o subrepositório embarcado
+DGS-AI-FIRST/dgs-ai-first/
+
+# Ignorar arquivos de sistema
+.DS_Store
+Thumbs.db
+desktop.ini
